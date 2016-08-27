@@ -1,0 +1,304 @@
+diff --git a/include/system/graphics.h b/include/system/graphics.h
+index afd9f7b..3e04b41 100644
+--- a/include/system/graphics.h
++++ b/include/system/graphics.h
+@@ -439,7 +439,21 @@ enum {
+     /* Legacy formats (deprecated), used by ImageFormat.java */
+     HAL_PIXEL_FORMAT_YCbCr_422_SP       = 0x10, // NV16
+     HAL_PIXEL_FORMAT_YCrCb_420_SP       = 0x11, // NV21
++#ifdef SPRD_HARDWARE
++    HAL_PIXEL_FORMAT_YCbCr_422_P        = 0x12,
++    HAL_PIXEL_FORMAT_YCbCr_420_P        = 0x13,
++#endif
+     HAL_PIXEL_FORMAT_YCbCr_422_I        = 0x14, // YUY2
++#ifdef SPRD_HARDWARE
++    HAL_PIXEL_FORMAT_YCbCr_420_I        = 0x15,
++    HAL_PIXEL_FORMAT_CbYCrY_422_I       = 0x16,
++    HAL_PIXEL_FORMAT_CbYCrY_420_I       = 0x17,
++    HAL_PIXEL_FORMAT_YCbCr_420_SP_TILED = 0x18,
++    HAL_PIXEL_FORMAT_YCbCr_420_SP       = 0x19,
++    HAL_PIXEL_FORMAT_YCrCb_420_SP_TILED = 0x1A,
++    HAL_PIXEL_FORMAT_YCrCb_422_SP       = 0x1B,
++    HAL_PIXEL_FORMAT_YCrCb_420_P        = 0x1C,
++#endif
+ };
+ 
+ /*
+diff --git a/init/Android.mk b/init/Android.mk
+index 85dfbfc..3f6fb69 100644
+--- a/init/Android.mk
++++ b/init/Android.mk
+@@ -10,6 +10,14 @@ else
+ init_options += -DALLOW_LOCAL_PROP_OVERRIDE=0 -DALLOW_DISABLE_SELINUX=0
+ endif
+ 
++ifneq (,$(TARGET_NR_SVC_SUPP_GIDS))
++init_options += -DNR_SVC_SUPP_GIDS=$(TARGET_NR_SVC_SUPP_GIDS)
++endif
++
++ifeq ($(TARGET_NEEDS_PROP_INIT_HACK),true)
++init_options += -DNEEDS_PROP_INIT_HACK
++endif
++
+ init_options += -DLOG_UEVENTS=0
+ 
+ init_cflags += \
+@@ -76,7 +84,8 @@ LOCAL_MODULE:= init
+ LOCAL_C_INCLUDES += \
+     external/zlib \
+     system/extras/ext4_utils \
+-    system/core/mkbootimg
++    system/core/mkbootimg \
++    $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include/mtd
+ 
+ LOCAL_FORCE_STATIC_EXECUTABLE := true
+ LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)
+diff --git a/init/builtins.cpp b/init/builtins.cpp
+index 1681d17..4d137c3 100644
+--- a/init/builtins.cpp
++++ b/init/builtins.cpp
+@@ -55,6 +55,10 @@
+ #define UNMOUNT_CHECK_MS 5000
+ #define UNMOUNT_CHECK_TIMES 10
+ 
++#include <private/android_filesystem_config.h>
++#include <sys/ioctl.h>
++#include "ubi-user.h"
++
+ int add_environment(const char *name, const char *value);
+ 
+ // System call provided by bionic but not in any header file.
+@@ -330,6 +334,34 @@ int do_mkdir(int nargs, char **args)
+     return e4crypt_set_directory_policy(args[1]);
+ }
+ 
++#define UBI_CTRL_DEV "/dev/ubi_ctrl"
++int do_ubiAttach(int nargs, char **args)
++{
++    struct ubi_attach_req req;
++    int fd;
++    int ret;
++
++    ERROR("do_ubiAttach %s %s\n",args[1],args[2]);
++
++    memset(&req, 0, sizeof(struct ubi_attach_req));
++    req.ubi_num =(typeof(req.ubi_num))atoi(args[1]);
++    if(-1 == req.ubi_num){
++        req.ubi_num = UBI_DEV_NUM_AUTO;
++    }
++    req.mtd_num = (typeof(req.mtd_num))mtd_name_to_number( args[2]);
++
++    fd = open(UBI_CTRL_DEV, O_RDONLY);
++    if(-1 == fd){
++        return -1;
++    }
++    ret = ioctl(fd, UBI_IOCATT, &req);
++    close(fd);
++    if(-1 == ret){
++        return -1;
++    }
++    return 0;
++}
++
+ static struct {
+     const char *name;
+     unsigned flag;
+@@ -960,3 +992,13 @@ int do_setusercryptopolicies(int nargs, char **args)
+     }
+     return e4crypt_set_user_crypto_policies(args[1]);
+ }
++
++int do_pipe(int nargs, char **args)
++{
++    mode_t mode = get_mode(args[1]);
++    if (mkfifo(args[2], mode) < 0) {
++	ERROR("peter do pipe error haha\n");
++        return -errno;
++    }
++    return 0;
++}
+diff --git a/init/init.cpp b/init/init.cpp
+index 58d7d34..3ea8648 100644
+--- a/init/init.cpp
++++ b/init/init.cpp
+@@ -91,6 +91,11 @@ bool waiting_for_exec = false;
+ 
+ static int epoll_fd = -1;
+ 
++#ifdef NEEDS_PROP_INIT_HACK
++static char hardware[32];
++static unsigned revision = 0;
++#endif
++
+ void register_epoll_handler(int fd, void (*fn)()) {
+     epoll_event ev;
+     ev.events = EPOLLIN;
+@@ -806,6 +811,10 @@ static void import_kernel_nv(char *name, bool for_emulator)
+ }
+ 
+ static void export_kernel_boot_props() {
++#ifdef NEEDS_PROP_INIT_HACK
++    char tmp[PROP_VALUE_MAX];
++    int ret;
++#endif
+     struct {
+         const char *src_prop;
+         const char *dst_prop;
+@@ -816,8 +825,10 @@ static void export_kernel_boot_props() {
+ #endif
+         { "ro.boot.mode",       "ro.bootmode",   "unknown", },
+         { "ro.boot.baseband",   "ro.baseband",   "unknown", },
++#ifndef NEEDS_PROP_INIT_HACK
+         { "ro.boot.bootloader", "ro.bootloader", "unknown", },
+         { "ro.boot.hardware",   "ro.hardware",   "unknown", },
++#endif
+ #ifndef IGNORE_RO_BOOT_REVISION
+         { "ro.boot.revision",   "ro.revision",   "0", },
+ #endif
+@@ -827,6 +838,22 @@ static void export_kernel_boot_props() {
+         int rc = property_get(prop_map[i].src_prop, value);
+         property_set(prop_map[i].dst_prop, (rc > 0) ? value : prop_map[i].default_value);
+     }
++
++#ifdef NEEDS_PROP_INIT_HACK
++   get_hardware_name(hardware, &revision);
++
++   /* if this was given on kernel command line, override what we read
++    * before (e.g. from /proc/cpuinfo), if anything */
++   ret = property_get("ro.boot.hardware", tmp);
++   if (ret)
++       strlcpy(hardware, tmp, sizeof(hardware));
++   property_set("ro.hardware", hardware);
++
++   ret = property_get("ro.boot.revision", tmp);
++   if (!ret)
++       snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
++   property_set("ro.revision", tmp);
++#endif
+ }
+ 
+ static void process_kernel_dt(void)
+diff --git a/init/init.h b/init/init.h
+index c166969..2518631 100644
+--- a/init/init.h
++++ b/init/init.h
+@@ -88,7 +88,9 @@ struct svcenvinfo {
+ #define SVC_DISABLED_START 0x200  // A start was requested but it was disabled at the time.
+ #define SVC_EXEC           0x400  // This synthetic service corresponds to an 'exec'.
+ 
++#ifndef NR_SVC_SUPP_GIDS
+ #define NR_SVC_SUPP_GIDS 12    /* twelve supplementary groups */
++#endif
+ 
+ #define COMMAND_RETRY_TIMEOUT 5
+ 
+diff --git a/init/init_parser.cpp b/init/init_parser.cpp
+index c36d36e..2afea68 100644
+--- a/init/init_parser.cpp
++++ b/init/init_parser.cpp
+@@ -173,6 +173,7 @@ static int lookup_keyword(const char *s)
+         break;
+     case 'p':
+         if (!strcmp(s, "owerctl")) return K_powerctl;
++        if (!strcmp(s, "ipe")) return K_pipe;
+         break;
+     case 'r':
+         if (!strcmp(s, "estart")) return K_restart;
+@@ -201,6 +202,7 @@ static int lookup_keyword(const char *s)
+         break;
+     case 'u':
+         if (!strcmp(s, "ser")) return K_user;
++        if (!strcmp(s, "biattach")) return K_ubiattach;
+         break;
+     case 'v':
+         if (!strcmp(s, "erity_load_state")) return K_verity_load_state;
+diff --git a/init/keywords.h b/init/keywords.h
+index 303685d..d3a76b3 100644
+--- a/init/keywords.h
++++ b/init/keywords.h
+@@ -12,6 +12,7 @@ int do_ifup(int nargs, char **args);
+ int do_insmod(int nargs, char **args);
+ int do_installkey(int nargs, char **args);
+ int do_mkdir(int nargs, char **args);
++int do_ubiAttach(int nargs, char **args);
+ int do_mount_all(int nargs, char **args);
+ int do_mount(int nargs, char **args);
+ int do_powerctl(int nargs, char **args);
+@@ -38,6 +39,7 @@ int do_load_persist_props(int nargs, char **args);
+ int do_load_system_props(int nargs, char **args);
+ int do_verity_load_state(int nargs, char **args);
+ int do_verity_update_state(int nargs, char **args);
++int do_pipe(int nargs, char **args);
+ int do_wait(int nargs, char **args);
+ #define __MAKE_KEYWORD_ENUM__
+ #define KEYWORD(symbol, flags, nargs, func) K_##symbol,
+@@ -71,6 +73,7 @@ enum {
+     KEYWORD(load_persist_props,    COMMAND, 0, do_load_persist_props)
+     KEYWORD(loglevel,    COMMAND, 1, do_loglevel)
+     KEYWORD(mkdir,       COMMAND, 1, do_mkdir)
++    KEYWORD(ubiattach,   COMMAND, 2, do_ubiAttach)
+     KEYWORD(mount_all,   COMMAND, 1, do_mount_all)
+     KEYWORD(mount,       COMMAND, 3, do_mount)
+     KEYWORD(oneshot,     OPTION,  0, 0)
+@@ -102,6 +105,7 @@ enum {
+     KEYWORD(wait,        COMMAND, 1, do_wait)
+     KEYWORD(write,       COMMAND, 2, do_write)
+     KEYWORD(writepid,    OPTION,  0, 0)
++    KEYWORD(pipe,        COMMAND, 2, do_pipe)
+ #ifdef __MAKE_KEYWORD_ENUM__
+     KEYWORD_COUNT,
+ };
+diff --git a/init/util.cpp b/init/util.cpp
+index b006e0b..1a21655 100644
+--- a/init/util.cpp
++++ b/init/util.cpp
+@@ -401,6 +401,35 @@ void open_devnull_stdio(void)
+     }
+ }
+ 
++#ifdef NEEDS_PROP_INIT_HACK
++void get_hardware_name(char *hardware, unsigned int *revision) {
++    FILE* fp;
++    if ((fp = fopen("/proc/cpuinfo", "r"))) {
++        char buf[1024];
++        while (fgets(buf, sizeof(buf), fp) != NULL) {
++            if (strncmp(buf, "Hardware", 8) == 0) {
++                const char* hw;
++                if ((hw = strstr(buf, ": "))) {
++                    hw += 2;
++                    size_t n = 0;
++                    while (*hw) {
++                        if (!isspace(*hw))
++                            hardware[n++] = tolower(*hw);
++                        hw++;
++                        if (n == 31)
++                            break;
++                    }
++                    hardware[n] = 0;
++                }
++            } else if (strncmp(buf, "Revision", 8) == 0) {
++                sscanf(buf, "Revision : %ux", revision);
++            }
++        }
++        fclose(fp);
++    }
++}
++#endif
++
+ void import_kernel_cmdline(bool in_qemu, std::function<void(char*,bool)> import_kernel_nv)
+ {
+     char cmdline[2048];
+diff --git a/init/util.h b/init/util.h
+index 09d64cd..560b492 100644
+--- a/init/util.h
++++ b/init/util.h
+@@ -58,6 +58,9 @@ void make_link_init(const char *oldpath, const char *newpath);
+ void remove_link(const char *oldpath, const char *newpath);
+ int wait_for_file(const char *filename, int timeout);
+ void open_devnull_stdio(void);
++#ifdef NEEDS_PROP_INIT_HACK
++void get_hardware_name(char *hardware, unsigned int *revision);
++#endif
+ void import_kernel_cmdline(bool in_qemu, std::function<void(char*,bool)>);
+ int make_dir(const char *path, mode_t mode);
+ int restorecon(const char *pathname);
