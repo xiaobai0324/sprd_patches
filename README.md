@@ -1,1 +1,1 @@
-# sprd_patches
+SPRD patches for building CyanogenMod 13.0.
